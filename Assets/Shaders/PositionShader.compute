@@ -1,0 +1,135 @@
+#pragma kernel CSMain
+
+struct Particle {
+    float2 position;
+    float2 velocity;
+    float4 color;
+    int colorIndex;
+};
+
+// Particle data buffers
+RWStructuredBuffer<Particle> particlesBuffer;
+StructuredBuffer<float> frictionMatrix;
+
+// Grid management buffers
+StructuredBuffer<int> gridStartBuffer;
+StructuredBuffer<int> gridEndBuffer;
+StructuredBuffer<uint> particleIndexBuffer;
+
+cbuffer SimParams {
+    float cellSize;
+    int gridWidth;
+    int gridHeight;
+    float halfWidthInv;
+    float halfHeightInv;
+    float width;
+    float height;
+    float rMax;
+    float rMaxSquared;
+    float frictionFactor;
+    float forceFactor;
+    float timeStep;
+    float beta;
+    float maxSpeed;
+    float screenLeft;
+    float screenRight;
+    float screenBottom;
+    float screenTop;
+    uint numParticles;
+    uint numColors;
+};
+
+float ComputeForce(float dist, float attractionForce, float beta) {
+    if (dist <= beta) {
+        return 1.5 * dist / beta - 1.5;
+    } else if (dist > beta && dist < 1.0) {
+        return attractionForce * (1 - abs(2 * dist - 1 - beta) / (1 - beta));
+    } else {
+        return 0;
+    }
+}
+
+
+[numthreads(128, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numParticles) return;
+
+    Particle current = particlesBuffer[i];
+    float2 totalForce = float2(0, 0);
+
+    // Determine the grid cell of the current particle
+    int2 gridPos = int2(
+        floor((current.position.x - screenLeft) / cellSize),
+        floor((current.position.y - screenBottom) / cellSize)
+    );
+
+    // Iterate over neighboring grid cells
+    for (int gx = -1; gx <= 1; gx++)
+    {
+        for (int gy = -1; gy <= 1; gy++)
+        {
+            int2 neighborCell = gridPos + int2(gx, gy);
+
+            // Wrap grid cells (toroidal space)
+            if (neighborCell.x < 0) neighborCell.x += gridWidth;
+            if (neighborCell.x >= gridWidth) neighborCell.x -= gridWidth;
+            if (neighborCell.y < 0) neighborCell.y += gridHeight;
+            if (neighborCell.y >= gridHeight) neighborCell.y -= gridHeight;
+
+            uint cellIndex = neighborCell.y * gridWidth + neighborCell.x;
+            uint startIndex = gridStartBuffer[cellIndex];
+            uint endIndex = gridEndBuffer[cellIndex];
+
+            // Loop over particles in the neighboring cell
+            for (uint j = startIndex; j < endIndex; j++)
+            {
+                uint neighborIndex = particleIndexBuffer[j];
+                if (neighborIndex == i) continue;
+
+                Particle other = particlesBuffer[neighborIndex];
+                float2 diff = current.position - other.position;
+
+                if (diff.x * halfWidthInv > 1.0)
+                    diff.x -= width;
+                else if (diff.x * halfWidthInv < -1.0)
+                    diff.x += width;
+                if (diff.y * halfHeightInv > 1.0)
+                    diff.y -= height;
+                else if (diff.y * halfHeightInv < -1.0)
+                    diff.y += height;
+
+                float distSqr = dot(diff, diff);
+                if (distSqr < rMaxSquared && distSqr > 0.0001)
+                {
+                    float dist = sqrt(distSqr);
+                    int index = current.colorIndex * numColors + other.colorIndex;
+                    float attractionForce = frictionMatrix[index];
+                    float f = -ComputeForce(dist / rMax, attractionForce, beta);
+                    totalForce += diff * (f / dist);
+                }
+            }
+        }
+    }
+
+    current.velocity *= frictionFactor;
+    current.velocity += totalForce * (rMax * forceFactor);
+
+    float speed = length(current.velocity);
+    if (speed > maxSpeed)
+        current.velocity = (current.velocity / speed) * maxSpeed;
+
+    current.position += current.velocity * timeStep;
+
+    if (current.position.x < screenLeft)
+        current.position.x += width;
+    else if (current.position.x > screenRight)
+        current.position.x -= width;
+    if (current.position.y < screenBottom)
+        current.position.y += height;
+    else if (current.position.y > screenTop)
+        current.position.y -= height;
+
+    particlesBuffer[i] = current;
+}
